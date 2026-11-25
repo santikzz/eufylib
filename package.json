@@ -1,0 +1,18 @@
+{
+  "name": "eufy-lock",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "eufy": "node cli.ts",
+    "test": "node --test",
+    "typecheck": "tsc"
+  },
+  "dependencies": {
+    "eufy-security-client": "4.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
