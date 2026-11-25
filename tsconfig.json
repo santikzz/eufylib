@@ -4,11 +4,12 @@
     "lib": ["es2024"],
     "module": "nodenext",
     "strict": true,
-    "noEmit": true,
     "skipLibCheck": true,
     "erasableSyntaxOnly": true,
-    "allowImportingTsExtensions": true,
-    "types": ["node"]
+    "rewriteRelativeImportExtensions": true,
+    "types": ["node"],
+    "outDir": "dist",
+    "declaration": true
   },
   "include": ["*.ts"]
 }

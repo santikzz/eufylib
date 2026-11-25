@@ -1,10 +1,14 @@
+#!/usr/bin/env node
 import { randomInt } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { inspect } from "node:util";
-import { EufyError, EufyLib, type Lock, type User } from "./eufylib.ts";
+import { loadConfig } from "./config.ts";
+import { EufyError } from "./errors.ts";
+import { EufyLib, type Lock, type User } from "./eufylib.ts";
+import { describeSchedule, validSchedule, type Schedule } from "./schedule.ts";
 
 const HELP = `
   status                        state of the lock
@@ -13,6 +17,9 @@ const HELP = `
   add NAME [PIN] [YYYY-MM-DD]   create a person, "-" or no PIN makes a random one, the date is the last valid day
   delete USER [-y]              USER is an id or a name, quote names with spaces
   pin USER [PIN]                change a PIN
+  schedule USER always
+  schedule USER mon,tue 09:00 18:00
+  schedule USER 2026-11-25T18:00 2026-11-26T10:00
   history [COUNT]               who opened the door, how and when
   lock | unlock
   watch                         print live events until Ctrl+C (the shell always prints them)
@@ -41,13 +48,29 @@ function clean(value: unknown): string {
 }
 
 function printUsers(users: User[]): void {
-  const rows = users.map((user) => COLUMNS.map((key) => clean(key === "type" ? (USER_TYPES[user.type] ?? user.type) : user[key])));
+  const rows = users.map(({ id, name, type, pins, fingerprints, schedules }) => {
+    const access = schedules.map(describeSchedule).join(", ") || "-";
+    return [id, name, USER_TYPES[type] ?? type, pins, fingerprints, access].map(clean);
+  });
   const widths = COLUMNS.map((key, i) => Math.max(key.length, ...rows.map((row) => row[i].length)));
   for (const row of [[...COLUMNS], ...rows]) console.log(row.map((cell, i) => cell.padEnd(widths[i])).join("  "));
 }
 
 function randomPin(): string {
   return String(randomInt(1_000_000)).padStart(6, "0");
+}
+
+// from today until the end of the given day
+function untilDay(day: string): Schedule {
+  const now = new Date();
+  const today = [now.getFullYear(), now.getMonth() + 1, now.getDate()].map((part) => String(part).padStart(2, "0")).join("-");
+  return validSchedule({ type: "range", from: `${today}T00:00`, until: `${day}T23:59` });
+}
+
+function readSchedule(words: string[]): Schedule {
+  if (words.length === 3) return validSchedule({ type: "weekly", days: words[0].split(","), start: words[1], end: words[2] });
+  if (words.length === 2) return validSchedule({ type: "range", from: words[0], until: words[1] });
+  return validSchedule({ type: words[0] });
 }
 
 function need(value: string | undefined, what: string): string {
@@ -76,7 +99,8 @@ async function run(lock: Lock, [command, ...args]: string[]): Promise<void> {
     case "add": {
       const name = need(args[0], "NAME");
       const pin = !args[1] || args[1] === "-" ? randomPin() : args[1];
-      await lock.addUser(name, pin, args[2]);
+      const { warning } = await lock.addUser(name, pin, args[2] ? untilDay(args[2]) : undefined);
+      if (warning) console.log(warning);
       return console.log(`Added ${clean(name)}. PIN ${pin}. The lock never shows it again.`);
     }
     case "delete": {
@@ -88,8 +112,14 @@ async function run(lock: Lock, [command, ...args]: string[]): Promise<void> {
     }
     case "pin": {
       const pin = args[1] ?? randomPin();
-      const user = await lock.setPin(need(args[0], "USER"), pin);
+      const user = await lock.findUser(need(args[0], "USER"));
+      await lock.setPin(user.id, pin);
       return console.log(`Changed the PIN of ${clean(user.name)} to ${pin}. The lock never shows it again.`);
+    }
+    case "schedule": {
+      const user = await lock.findUser(need(args[0], "USER"));
+      const { warning } = await lock.setSchedule(user.id, readSchedule(args.slice(1)));
+      return console.log(warning ?? `Changed the schedule of ${clean(user.name)}.`);
     }
     case "lock":
     case "unlock":
@@ -105,6 +135,7 @@ async function run(lock: Lock, [command, ...args]: string[]): Promise<void> {
 async function login(lib: EufyLib): Promise<void> {
   let result = await lib.login();
   while (result.status !== "connected") {
+    if (result.status === "disconnected") throw new EufyError(`Login failed: ${result.error ?? "unknown reason"}`);
     if (result.status === "captcha") {
       const image = join(tmpdir(), "eufy-captcha.png");
       writeFileSync(image, Buffer.from(result.image.split(",").at(-1) ?? "", "base64"));
@@ -143,14 +174,8 @@ async function main(words: string[]): Promise<number> {
     console.log(HELP);
     return 0;
   }
-  process.loadEnvFile(join(import.meta.dirname, ".env"));
-  const { EUFY_USERNAME: username, EUFY_PASSWORD: password, EUFY_COUNTRY: country, EUFY_LOCK: serial } = process.env;
-  if (!username || !password || !/^[A-Z]{2}$/.test(country ?? "")) {
-    throw new EufyError("Set EUFY_USERNAME, EUFY_PASSWORD and EUFY_COUNTRY (two capital letters) in .env");
-  }
-  const lib = await EufyLib.open({ username, password, country: country! }, join(import.meta.dirname, "data"), (line) =>
-    console.error(`eufy: ${clean(line)}`),
-  );
+  const { credentials, serial, dataDir } = loadConfig();
+  const lib = await EufyLib.open(credentials, dataDir, (line) => console.error(`eufy: ${clean(line)}`));
   try {
     await login(lib);
     const lock = await lib.lock(serial);

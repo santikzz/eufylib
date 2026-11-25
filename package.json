@@ -1,18 +1,37 @@
 {
-  "name": "eufy-lock",
-  "private": true,
+  "name": "eufylib",
+  "version": "0.1.0",
+  "description": "Manage the people, PINs and schedules of a eufy smart lock from TypeScript, a REST API or the terminal",
+  "keywords": ["eufy", "smart-lock", "door", "access-control", "pin", "rest-api", "cli"],
+  "license": "MIT",
   "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/eufylib.d.ts",
+      "default": "./dist/eufylib.js"
+    }
+  },
+  "bin": {
+    "eufylib": "dist/cli.js",
+    "eufylib-api": "dist/api.js"
+  },
+  "files": ["dist", "API.md"],
   "scripts": {
-    "eufy": "node cli.ts",
+    "start": "node api.ts",
+    "cli": "node cli.ts",
     "test": "node --test",
-    "typecheck": "tsc"
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {
     "eufy-security-client": "4.1.0"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
-    "node": "^24.0.0",
     "typescript": "^5.9.0"
   }
 }

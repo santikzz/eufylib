@@ -1,5 +1,8 @@
 import { mkdirSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { isDeepStrictEqual } from "node:util";
 import {
   EufySecurity,
   LockPushEvent,
@@ -12,20 +15,32 @@ import {
   type EufySecurityEvents,
   type LoginOptions,
   type PropertyValue,
-  type Schedule,
 } from "eufy-security-client";
+import { EufyError, Unconfirmed } from "./errors.ts";
+import { parseSchedule, toDriver, toRaw, type Schedule, type StoredSchedule } from "./schedule.ts";
 
-export class EufyError extends Error {}
+// eufy-security-client 4.1.0 writes a week below 0x10 as one hex digit, and its encoder then drops it:
+// a "monday only" schedule would reach the lock without days. Pad it until the client fixes it
+const require = createRequire(import.meta.url);
+const clientUtils = require(join(dirname(require.resolve("eufy-security-client")), "http", "utils.js"));
+const hexWeek = clientUtils.hexWeek;
+clientUtils.hexWeek = (schedule: unknown) => String(hexWeek(schedule)).padStart(2, "0");
 
-// the command was sent but nothing confirmed it, so it may have worked
-export class Unconfirmed extends EufyError {}
+export { EufyError, Unconfirmed, type ErrorKind } from "./errors.ts";
+export {
+  describeSchedule,
+  parseSchedule,
+  validSchedule,
+  type Day,
+  type Schedule,
+  type StoredSchedule,
+} from "./schedule.ts";
 
 export type Credentials = { username: string; password: string; country: string };
 
-export type LoginResult =
-  | { status: "connected" }
-  | { status: "code" }
-  | { status: "captcha"; captchaId: string; image: string };
+type Challenge = { status: "code" } | { status: "captcha"; captchaId: string; image: string };
+
+export type LoginState = { status: "connected" } | { status: "disconnected"; error: string | null } | Challenge;
 
 export type LoginAnswer = { code: string } | { captchaId: string; captcha: string };
 
@@ -33,10 +48,14 @@ export type User = {
   id: string;
   name: string;
   type: UserType;
+  isAdmin: boolean;
   pins: number;
   fingerprints: number;
-  access: string;
+  schedules: StoredSchedule[];
 };
+
+// warning is set when the lock obeys but the copy for the eufy app did not change
+export type Written = { user: User; warning: string | null };
 
 export type LockEvent = { time: Date; name: string; value: unknown };
 
@@ -52,7 +71,7 @@ export type Capabilities = {
 type Driver = Pick<
   EufySecurity,
   | "on" | "off" | "close" | "connect" | "isConnected" | "getApi" | "getDevices"
-  | "addUser" | "deleteUser" | "updateUserPasscode" | "setDeviceProperty"
+  | "addUser" | "deleteUser" | "updateUserPasscode" | "updateUserSchedule" | "setDeviceProperty"
 >;
 
 const PERSONAL_EVENTS = new Set<number>([
@@ -66,15 +85,21 @@ const PERSONAL_EVENTS = new Set<number>([
   LockPushEvent.TEMPORARY_PW_UNLOCK,
 ]);
 const BATTERY_PARAM = 6001;
-const DAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+const ALWAYS: Schedule = { type: "always" };
 
 export class EufyLib {
   private driver: Driver;
   private timeoutMs: number;
+  private challenge: Challenge | null = null;
+  private failure: string | null = null;
 
+  // eufy can ask for a code at any time, not only during a login
   constructor(driver: Driver, timeoutMs = 45_000) {
     this.driver = driver;
     this.timeoutMs = timeoutMs;
+    driver.on("tfa request", () => { this.challenge = { status: "code" }; });
+    driver.on("captcha request", (captchaId, image) => { this.challenge = { status: "captcha", captchaId, image }; });
+    driver.on("connection error", (error) => { this.failure = error.message; });
   }
 
   // dataDir keeps the cloud session, so a restart does not log in again
@@ -87,7 +112,7 @@ export class EufyLib {
         ...credentials,
         persistentDir: dataDir,
         p2pConnectionSetup: P2PConnectionType.QUICKEST,
-        pollingIntervalMinutes: 10,
+        pollingIntervalMinutes: 5,
         eventDurationSeconds: 10,
         enableEmbeddedPKCS1Support: true,
         logging: { level: LogLevel.Warn },
@@ -101,30 +126,20 @@ export class EufyLib {
     this.driver.close();
   }
 
-  // wrong answers can lock the eufy account for a while, so this never retries
-  async login(answer?: LoginAnswer): Promise<LoginResult> {
-    let challenge: LoginResult | undefined;
-    let failure: Error | undefined;
-    const onCode = () => { challenge = { status: "code" }; };
-    const onCaptcha = (captchaId: string, image: string) => { challenge = { status: "captcha", captchaId, image }; };
-    const onError = (error: Error) => { failure = error; };
-    this.driver.on("tfa request", onCode);
-    this.driver.on("captcha request", onCaptcha);
-    this.driver.on("connection error", onError);
-    try {
-      await this.driver.connect(answer && toLoginOptions(answer));
-    } finally {
-      this.driver.off("tfa request", onCode);
-      this.driver.off("captcha request", onCaptcha);
-      this.driver.off("connection error", onError);
-    }
-    if (challenge) return challenge;
-    if (!this.driver.isConnected()) throw new EufyError(`Login failed: ${failure?.message ?? "unknown reason"}`);
+  get loginState(): LoginState {
+    if (this.driver.isConnected() && this.driver.getApi().isConnected()) return { status: "connected" };
+    if (this.challenge) return this.challenge;
     // the client can report a login on the new cloud only, but devices and users live in the old one
-    if (!this.driver.getApi().isConnected()) {
-      throw new EufyError("eufy accepts this account on the new cloud, but not on the old one that this library uses.");
-    }
-    return { status: "connected" };
+    const halfway = this.driver.isConnected() ? "eufy refused the login on the old cloud that this library uses." : null;
+    return { status: "disconnected", error: this.failure ?? halfway };
+  }
+
+  // wrong answers can lock the eufy account for a while, so this never retries
+  async login(answer?: LoginAnswer): Promise<LoginState> {
+    this.challenge = null;
+    this.failure = null;
+    await this.driver.connect(answer && toLoginOptions(answer));
+    return this.loginState;
   }
 
   async lock(serial?: string): Promise<Lock> {
@@ -132,12 +147,12 @@ export class EufyLib {
       this.driver.getDevices(),
       sleep(this.timeoutMs, undefined, { ref: false }),
     ]);
-    if (!devices) throw new EufyError("The cloud did not send the device list in time.");
+    if (!devices) throw new EufyError("The cloud did not send the device list in time.", "unavailable");
     const locks = devices.filter((device) => device.isLock());
     const found = serial ? locks.filter((device) => device.getSerial() === serial) : locks;
     if (found.length !== 1) {
       const known = locks.map((device) => `${device.getSerial()} (${device.getName()})`).join(", ");
-      throw new EufyError(`Found ${found.length} locks. Choose one serial. Known: ${known || "none"}`);
+      throw new EufyError(`Found ${found.length} locks. Choose one serial. Known: ${known || "none"}`, "unavailable");
     }
     return new Lock(this.driver, found[0], this.timeoutMs);
   }
@@ -205,17 +220,18 @@ export class Lock {
   async users(): Promise<User[]> {
     const users = await this.driver.getApi().getUsers(this.serial, this.device.getStationSerial());
     // null is a failed request, not an empty list
-    if (!users) throw new EufyError("The cloud did not return the user list.");
+    if (!users) throw new EufyError("The cloud did not return the user list.", "unavailable");
     return users.map((user) => {
       const credentials = user.password_list ?? [];
-      const schedules = credentials.flatMap(({ schedule }) => (schedule ? [describeSchedule(schedule)] : []));
+      const schedules = credentials.flatMap(({ schedule }) => (schedule ? [parseSchedule(schedule)] : []));
       return {
         id: String(user.short_user_id),
         name: String(user.user_name ?? ""),
         type: user.user_type,
+        isAdmin: user.user_type === UserType.ADMIN || user.user_type === UserType.SUPER_ADMIN,
         pins: credentials.filter((item) => item.password_type === UserPasswordType.PIN).length,
         fingerprints: credentials.filter((item) => item.password_type === UserPasswordType.FINGERPRINT).length,
-        access: [...new Set(schedules)].join(", ") || "-",
+        schedules: schedules.filter((item, i) => schedules.findIndex((other) => isDeepStrictEqual(other, item)) === i),
       };
     });
   }
@@ -226,57 +242,123 @@ export class Lock {
     return records.flatMap(({ extra }) => parseAccess(extra) ?? []).sort((a, b) => +b.time - +a.time);
   }
 
-  // until is the last valid day, YYYY-MM-DD, enforced by the lock itself
-  async addUser(rawName: string, pin: string, until?: string): Promise<void> {
+  async addUser(rawName: string, pin: string, schedule: Schedule = ALWAYS): Promise<Written> {
     const name = validName(rawName);
     validPin(pin);
-    const schedule = until === undefined ? undefined : scheduleUntil(until);
-    if ((await this.users()).some((user) => user.name.trim() === name)) {
-      throw new EufyError(`A user named "${name}" already exists.`);
+    const before = await this.users();
+    if (before.some((user) => user.name.trim() === name)) {
+      throw new EufyError(`A user named "${name}" already exists.`, "conflict");
     }
     // the cloud entry is made before the lock takes the PIN, so only the event is proof
     try {
-      await this.userCommand("user added", name, () => this.driver.addUser(this.serial, name, pin, schedule));
+      await this.userCommand("user added", name, () => this.driver.addUser(this.serial, name, pin, toDriver(schedule)));
     } catch (error) {
       if (error instanceof EufyError) error.message += " Check the list: an entry may be left behind.";
       throw error;
     }
+    const known = new Set(before.map((user) => user.id));
+    const user = await this.waitForUser((item) => item.name.trim() === name && !known.has(item.id) && item.pins > 0);
+    if (!user) throw new Unconfirmed("The lock took the PIN, but the cloud does not list it yet. Check the list later.");
+    return this.copyToCloud(user, schedule);
   }
 
-  async deleteUser(who: string): Promise<User> {
-    const user = await this.findUser(who);
-    if (user.type === UserType.ADMIN || user.type === UserType.SUPER_ADMIN) {
-      throw new EufyError(`"${user.name}" is an admin. Delete it in the eufy app.`);
+  async setSchedule(id: string, schedule: Schedule): Promise<Written> {
+    const user = await this.userById(id);
+    // the client also writes the permission, always as entry only
+    if (user.type !== UserType.ENTRY_ONLY) {
+      throw new EufyError(`"${user.name}" is not an entry only user. Change it in the eufy app.`, "conflict");
     }
+    await this.userCommand("user schedule updated", user.name, () =>
+      this.driver.updateUserSchedule(this.serial, user.name, toDriver(schedule)),
+    );
+    return this.copyToCloud(user, schedule);
+  }
+
+  async deleteUser(id: string): Promise<User> {
+    const user = await this.userById(id);
+    if (user.isAdmin) throw new EufyError(`"${user.name}" is an admin. Delete it in the eufy app.`, "conflict");
     await this.userCommand("user deleted", user.name, () => this.driver.deleteUser(this.serial, user.name));
     return user;
   }
 
-  async setPin(who: string, pin: string): Promise<User> {
+  async setPin(id: string, pin: string): Promise<User> {
     validPin(pin);
-    const user = await this.findUser(who);
+    const user = await this.userById(id);
+    if (user.isAdmin) throw new EufyError(`"${user.name}" is an admin. Change its PIN in the eufy app.`, "conflict");
     // the client writes the same PIN to every PIN entry of the user
-    if (user.pins !== 1) throw new EufyError(`"${user.name}" has ${user.pins} PINs. Only a single PIN can change.`);
+    if (user.pins !== 1) {
+      throw new EufyError(`"${user.name}" has ${user.pins} PINs. Only a single PIN can change.`, "conflict");
+    }
     await this.userCommand("user passcode updated", user.name, () =>
       this.driver.updateUserPasscode(this.serial, user.name, pin),
     );
     return user;
   }
 
-  // the client works by exact name, so the name must be unique
+  // for people at a terminal: an id, or else a name
   async findUser(who: string): Promise<User> {
     const users = await this.users();
-    const byId = users.filter((user) => user.id === who);
-    const found = byId.length ? byId : users.filter((user) => user.name.trim() === who.trim());
-    if (!found.length) throw new EufyError(`No user "${who}".`);
-    if (found.length > 1 || users.filter((user) => user.name === found[0].name).length > 1) {
-      throw new EufyError(`Several users are named "${found[0].name}". Rename one in the eufy app.`);
+    const found = users.find((user) => user.id === who) ?? users.find((user) => user.name.trim() === who.trim());
+    if (!found) throw new EufyError(`No user "${who}".`, "not_found");
+    return found;
+  }
+
+  // the client works by exact name, so the name must be unique
+  private async userById(id: string): Promise<User> {
+    const users = await this.users();
+    const found = users.find((user) => user.id === id);
+    if (!found) throw new EufyError(`No user with id "${id}".`, "not_found");
+    if (users.filter((user) => user.name === found.name).length > 1) {
+      throw new EufyError(`Several users are named "${found.name}". Rename one in the eufy app.`, "conflict");
     }
-    return found[0];
+    return found;
+  }
+
+  private async waitForUser(matches: (user: User) => boolean): Promise<User | undefined> {
+    const deadline = Date.now() + this.timeoutMs / 3;
+    for (;;) {
+      const found = (await this.users()).find(matches);
+      if (found || Date.now() > deadline) return found;
+      await sleep(this.timeoutMs / 30);
+    }
+  }
+
+  // the eufy app and the user list read this copy, the keypad obeys the lock
+  private async copyToCloud(user: User, schedule: Schedule): Promise<Written> {
+    const wanted = parseSchedule(toRaw(schedule));
+    const done = (item: User) => item.id === user.id && item.schedules.every((one) => isDeepStrictEqual(one, wanted));
+    if (done(user)) return { user, warning: null };
+    let saved = false;
+    try {
+      const api = this.driver.getApi();
+      const raw = await api.getUsers(this.serial, this.device.getStationSerial());
+      const credentials = raw?.find((item) => String(item.short_user_id) === user.id)?.password_list ?? [];
+      const response = await api.request({
+        method: "post",
+        endpoint: "v1/app/device/password/save_or_update",
+        data: {
+          device_sn: this.serial,
+          short_user_id: user.id,
+          station_sn: "",
+          transaction: String(Date.now()),
+          password_list: credentials.map(({ password_id, password_type }) => ({
+            password_id,
+            password_type,
+            schedule: JSON.stringify(toRaw(schedule)),
+          })),
+        },
+      });
+      saved = credentials.length > 0 && (response.data as { code?: number } | undefined)?.code === 0;
+    } catch {
+      // the lock already obeys, so a failure here is only a warning
+    }
+    const updated = saved ? await this.waitForUser(done).catch(() => undefined) : undefined;
+    if (updated) return { user: updated, warning: null };
+    return { user, warning: "The lock has the new schedule, but the eufy app may show the old one. Save it again." };
   }
 
   private async userCommand(
-    success: "user added" | "user deleted" | "user passcode updated",
+    success: "user added" | "user deleted" | "user passcode updated" | "user schedule updated",
     name: string,
     send: () => Promise<void>,
   ): Promise<void> {
@@ -286,7 +368,9 @@ export class Lock {
         if (mine(device, username)) done();
       },
       "user error": (device, username, error) => {
-        if (mine(device, username)) done(new EufyError(describeError(error)));
+        if (!mine(device, username)) return;
+        const message = describeError(error);
+        done(new EufyError(message, /already used/i.test(message) ? "conflict" : "refused"));
       },
     }));
   }
@@ -334,71 +418,17 @@ export function parseAccess(extra: string): Access | null {
   }
 }
 
-// decode the hex schedule of the cloud, for example "mon tue 09:00-18:00"
-export function describeSchedule(raw: unknown): string {
-  let value: Record<string, unknown>;
-  try {
-    value = typeof raw === "string" ? JSON.parse(raw) : raw;
-  } catch {
-    return "unknown";
-  }
-  const [startDay, endDay, startTime, endTime, week] = ["startDay", "endDay", "startTime", "endTime", "week"].map(
-    (key) => String(value?.[key] ?? "").toLowerCase(),
-  );
-  const valid = [[startDay, 8], [endDay, 8], [startTime, 4], [endTime, 4], [week, 2]] as const;
-  if (!valid.every(([hex, length]) => hex.length === length && /^[0-9a-f]+$/.test(hex))) return "unknown";
-
-  // the eufy app writes one continuous range as week ff with two dates
-  if (week === "ff" && startDay !== "00000000" && endDay !== "ffffffff") {
-    return `from ${date(startDay)} ${clock(startTime)} until ${date(endDay)} ${clock(endTime)}`;
-  }
-  const bits = parseInt(week, 16) & 0x7f;
-  const days = DAYS.filter((_, bit) => (bits >> bit) & 1).join(" ");
-  const parts = [bits === 0x7f ? "every day" : days || "no day"];
-  if (startTime !== "0000" || endTime !== "ffff") parts.push(`${clock(startTime)}-${clock(endTime)}`);
-  if (startDay !== "00000000") parts.push(`from ${date(startDay)}`);
-  if (endDay !== "ffffffff") parts.push(`until ${date(endDay)}`);
-  return parts.join(" ") === "every day" ? "always" : parts.join(" ");
-}
-
-function clock(hex: string): string {
-  if (hex === "ffff") return "24:00";
-  return [hex.slice(0, 2), hex.slice(2)].map((part) => pad(parseInt(part, 16))).join(":");
-}
-
-// the year is little-endian, then month and day
-function date(hex: string): string {
-  const year = parseInt(hex.slice(2, 4) + hex.slice(0, 2), 16);
-  return `${year}-${pad(parseInt(hex.slice(4, 6), 16))}-${pad(parseInt(hex.slice(6, 8), 16))}`;
-}
-
-function pad(value: number): string {
-  return String(value).padStart(2, "0");
-}
-
-// whole days, so a continuous range and a daily window mean the same
-export function scheduleUntil(until: string, now = new Date()): Schedule {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(until);
-  const [year, month, day] = (match ?? []).slice(1).map(Number);
-  const endDateTime = new Date(year, month - 1, day, 23, 59);
-  if (!match || endDateTime.getMonth() !== month - 1 || endDateTime.getDate() !== day) {
-    throw new EufyError("The last day must be a real date, YYYY-MM-DD.");
-  }
-  if (endDateTime < now) throw new EufyError("The last day is in the past.");
-  return { startDateTime: new Date(now.getFullYear(), now.getMonth(), now.getDate()), endDateTime };
-}
-
 function validName(raw: string): string {
   const name = raw.trim();
   // the lock payload stores the length in one byte
   if (!name || /\p{C}/u.test(name) || Buffer.byteLength(name) > 255) {
-    throw new EufyError("The name must be printable text, 1 to 255 bytes.");
+    throw new EufyError("The name must be printable text, 1 to 255 bytes.", "invalid");
   }
   return name;
 }
 
 function validPin(pin: string): void {
-  if (!/^[0-9]{4,8}$/.test(pin)) throw new EufyError("The PIN must be 4 to 8 digits.");
+  if (!/^[0-9]{4,8}$/.test(pin)) throw new EufyError("The PIN must be 4 to 8 digits.", "invalid");
 }
 
 function toLoginOptions(answer: LoginAnswer): LoginOptions {
