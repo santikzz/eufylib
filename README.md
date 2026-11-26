@@ -114,9 +114,13 @@ can end the first session, and repeated logins can make eufy ask for a captcha.
 ## Docker
 
 ```sh
-docker build -t eufylib .
-docker run -d --env-file .env -e HOST=0.0.0.0 -v eufylib-data:/app/data -p 127.0.0.1:8090:8090 eufylib
+docker compose up -d --build
+docker compose logs -f
 ```
+
+The API listens on `127.0.0.1:8090` of the host. The eufy session stays in the `eufylib-data` volume. If eufy asks
+for a captcha or a code, read it from `GET /status` and send the answer to `POST /login`. Do not run the CLI against
+the same volume while the container runs.
 
 ## Security
 
