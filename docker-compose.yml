@@ -13,9 +13,12 @@ services:
     restart: unless-stopped
     # a lock task can take 45 s; let it finish before docker kills the process
     stop_grace_period: 60s
+    networks:
+      - eufy-network
 
 volumes:
   eufylib-data:
 
 networks:
-  - eufy-network
+  eufy-network:
+    external: true
