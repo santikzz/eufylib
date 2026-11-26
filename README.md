@@ -20,10 +20,10 @@ eufylib logs in to your eufy account as the eufy phone app does. It needs no hub
 - Create a person with a PIN, change a PIN, delete a person
 - Schedules: always, a date range, or weekly hours. The lock enforces them, also when it is offline
 - Lock and unlock, live events, battery, settings
-- Access history: who opened the door, how and when (library and CLI)
+- Access history: who opened the door, how and when, with a battery estimate from it
 - 2FA code and captcha login
 - Each change waits for the confirmation of the lock, not only for the cloud
-- REST API with a bearer token, one change at a time, and a user cache that refreshes every 5 minutes
+- REST API with a bearer token, one change at a time, and a user and history cache that refreshes every 5 minutes
 
 ## Requirements
 
@@ -51,7 +51,7 @@ npm run cli -- add "Ana Paz" - 2026-12-31         # random PIN, valid until the 
 npm run cli -- pin "Ana Paz"
 npm run cli -- schedule "Ana Paz" mon,fri 09:00 18:00
 npm run cli -- delete "Ana Paz"
-npm run cli -- history 20
+npm run cli -- history 7
 npm run cli -- help
 ```
 
@@ -87,7 +87,7 @@ const { user } = await lock.addUser("Ana Paz", "482913", {
   from: "2026-12-01T00:00",
   until: "2026-12-31T23:59",
 });
-console.log(user, await lock.history(20));
+console.log(user, await lock.history(new Date(Date.now() - 7 * 86_400_000)));
 eufy.close();
 ```
 

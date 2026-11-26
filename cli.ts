@@ -20,7 +20,7 @@ const HELP = `
   schedule USER always
   schedule USER mon,tue 09:00 18:00
   schedule USER 2026-11-25T18:00 2026-11-26T10:00
-  history [COUNT]               who opened the door, how and when
+  history [DAYS]                who opened the door, how and when
   lock | unlock
   watch                         print live events until Ctrl+C (the shell always prints them)
   help | exit
@@ -89,9 +89,9 @@ async function run(lock: Lock, [command, ...args]: string[]): Promise<void> {
     case "users":
       return printUsers(await lock.users());
     case "history": {
-      const count = Number(args[0] ?? 30);
-      if (!Number.isInteger(count) || count < 1) throw new EufyError("COUNT must be a whole number above 0.");
-      for (const { time, event, user, userId } of await lock.history(count)) {
+      const days = Number(args[0] ?? 1);
+      if (!Number.isInteger(days) || days < 1) throw new EufyError("DAYS must be a whole number above 0.");
+      for (const { time, event, user, userId } of await lock.history(new Date(Date.now() - days * 86_400_000))) {
         console.log(`${time.toLocaleString()}  ${event.padEnd(24)} ${user === null ? "" : clean(`${user} (${userId})`)}`);
       }
       return;

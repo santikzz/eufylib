@@ -11,7 +11,10 @@ Send `Authorization: Bearer <API_TOKEN>` with every request, except `GET /up`. A
 
 - Bodies and replies are JSON.
 - The service runs one eufy task at a time. A change can take up to 45 seconds, because it waits for the lock.
-- `GET /users` reads a cache. The service refreshes it every 5 minutes, after each change and on `POST /sync`.
+- `GET /users` and `GET /history` read a cache. The service refreshes it every 5 minutes, after each change and on
+  `POST /sync`.
+- The cache keeps the history of the last 90 days. The first sync reads all of it from eufy, page by page. The next
+  syncs read only the last day again.
 - Times are the wall clock of the lock, without a time zone.
 
 ## Endpoints
@@ -22,12 +25,15 @@ Send `Authorization: Bearer <API_TOKEN>` with every request, except `GET /up`. A
 | `GET` | `/status` | | [Status](#status) |
 | `POST` | `/login` | `{ "answer": "123456" }` or nothing | `{ "login": LoginState }` |
 | `GET` | `/users` | | `{ "users": [User], "syncedAt": "..." }` |
+| `GET` | `/history?from=&until=` | | `{ "history": [Access], "keptFrom": "...", "syncedAt": "..." }`, newest first |
 | `POST` | `/sync` | | same as `GET /users`, read from eufy now |
 | `POST` | `/users` | `{ "name", "pin"?, "schedule"? }` | `201 { "user": User, "pin", "warning" }` |
 | `PUT` | `/users/:id/pin` | `{ "pin"? }` | `{ "user": User, "pin" }` |
 | `PUT` | `/users/:id/schedule` | [Schedule](#schedule) | `{ "user": User, "warning" }` |
 | `DELETE` | `/users/:id` | | `{ "user": User }` |
 
+- `from`, `until`: ISO 8601 times, for example `2026-11-18T03:00:00.000Z`. `until` is now when it is not given, and
+  `from` is 7 days before `until`. `keptFrom` is the start of the 90 days in the cache: an older `from` gets no more.
 - `name`: 1 to 255 bytes of printable text, unique on the lock.
 - `pin`: 4 to 8 digits. Without it the service makes a random 6-digit PIN. The reply is the only place it appears.
 - `schedule`: `{ "type": "always" }` when it is not given.
@@ -53,6 +59,16 @@ Send `Authorization: Bearer <API_TOKEN>` with every request, except `GET /up`. A
 `type` is the eufy user type: `4` entry only, `1` admin, `2` owner. `schedules` has one entry per distinct schedule
 of the PINs and fingerprints of the person.
 
+### Access
+
+```json
+{ "time": "2026-11-25T21:00:00.000Z", "event": "pw unlock", "userId": "0007", "user": "Ana Paz", "battery": 80 }
+```
+
+`event` is the eufy event name in lowercase, for example `pw unlock`, `fingerprint unlock`, `manual unlock`,
+`auto lock` or `mechanical anomaly`. `userId` and `user` are null when the event does not prove who did it, such as
+auto lock or the inside knob. `battery` is the battery percent, or null.
+
 ### Schedule
 
 ```json
@@ -73,10 +89,17 @@ of the PINs and fingerprints of the person.
 {
   "login": { "status": "connected" },
   "lock": { "serial": "T8520...", "name": "Front door", "model": "T8510P", "locked": true, "battery": 80 },
+  "battery": { "perDay": 0.9, "daysLeft": 37, "emptyAt": "2027-01-01T08:00:00.000Z", "since": "...", "points": 6 },
   "syncedAt": "2026-11-25T21:00:00.000Z",
   "syncError": null
 }
 ```
+
+`battery` is an estimate of when the battery is empty, or null when the history does not show enough drain yet. The
+service draws a straight line through the moments the battery reached a new low since the last battery change, and
+extends it to 0 %. It needs 3 such moments over 3 days or more. `perDay` is the percent points lost each day, and
+`points` is the number of moments on the line. The drain changes with use and temperature, and the lock reports
+whole percents, so treat it as a guide.
 
 ### LoginState
 

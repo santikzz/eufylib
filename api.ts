@@ -9,6 +9,7 @@ import { validSchedule } from "./schedule.ts";
 
 const MAX_BODY = 16 * 1024;
 const MIN_TOKEN = 32;
+const DAY = 86_400_000;
 const STATUS: Record<ErrorKind, number> = {
   invalid: 400,
   not_found: 404,
@@ -20,7 +21,7 @@ const STATUS: Record<ErrorKind, number> = {
 
 type Body = Record<string, unknown>;
 type Reply = { status?: number; body: unknown };
-type Route = [method: string, path: RegExp, handle: (body: Body, id: string) => Promise<Reply>];
+type Route = [method: string, path: RegExp, handle: (body: Body, id: string, query: URLSearchParams) => Promise<Reply>];
 
 export function createApi(door: Door, token: string): Server {
   const routes: Route[] = [
@@ -31,6 +32,12 @@ export function createApi(door: Door, token: string): Server {
       return { body: door.users() };
     }],
     ["GET", /^\/users$/, async () => ({ body: door.users() })],
+    ["GET", /^\/history$/, async (_, __, query) => {
+      const until = optionalTime(query, "until") ?? new Date();
+      const from = optionalTime(query, "from") ?? new Date(+until - 7 * DAY);
+      if (from > until) throw new EufyError("from must be before until.", "invalid");
+      return { body: door.history(from, until) };
+    }],
     ["POST", /^\/users$/, async (body) => {
       const name = text(body, "name");
       const pin = optionalText(body, "pin") ?? randomPin();
@@ -53,20 +60,21 @@ export function createApi(door: Door, token: string): Server {
 
   return createServer(async (request, response) => {
     const started = Date.now();
-    const path = (request.url ?? "/").split("?")[0];
-    const { status = 200, body } = await answer(request, path).catch(toReply);
+    const url = new URL(request.url ?? "/", "http://eufylib");
+    const path = url.pathname;
+    const { status = 200, body } = await answer(request, path, url.searchParams).catch(toReply);
     response.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
     response.end(JSON.stringify(body));
     if (path !== "/up") console.log(`${request.method} ${JSON.stringify(path)} ${status} ${Date.now() - started}ms`);
   });
 
-  async function answer(request: IncomingMessage, path: string): Promise<Reply> {
+  async function answer(request: IncomingMessage, path: string, query: URLSearchParams): Promise<Reply> {
     if (path === "/up") return { body: { ok: true } };
     if (!sameToken(request.headers.authorization, token)) return { status: 401, body: { error: "unauthorized" } };
     const route = routes.find(([method, pattern]) => method === request.method && pattern.test(path));
     if (!route) return { status: 404, body: { error: "not_found", message: "No such route." } };
     const [, pattern, handle] = route;
-    return handle(await readBody(request), pattern.exec(path)?.[1] ?? "");
+    return handle(await readBody(request), pattern.exec(path)?.[1] ?? "", query);
   }
 }
 
@@ -113,6 +121,15 @@ function text(body: Body, field: string): string {
 
 function optionalText(body: Body, field: string): string | undefined {
   return body[field] === undefined || body[field] === null ? undefined : text(body, field);
+}
+
+// an ISO 8601 time, such as 2026-11-25T03:00:00.000Z
+function optionalTime(query: URLSearchParams, field: string): Date | undefined {
+  const value = query.get(field);
+  if (value === null) return undefined;
+  const time = new Date(value);
+  if (!/^\d{4}-\d{2}-\d{2}T/.test(value) || Number.isNaN(+time)) throw new EufyError(`${field} must be an ISO 8601 time.`, "invalid");
+  return time;
 }
 
 function randomPin(): string {

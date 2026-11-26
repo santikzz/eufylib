@@ -85,6 +85,8 @@ const PERSONAL_EVENTS = new Set<number>([
   LockPushEvent.TEMPORARY_PW_UNLOCK,
 ]);
 const BATTERY_PARAM = 6001;
+const HISTORY_PAGE = 500;
+const MAX_HISTORY_PAGES = 40;
 const ALWAYS: Schedule = { type: "always" };
 
 export class EufyLib {
@@ -236,10 +238,21 @@ export class Lock {
     });
   }
 
-  // newest first. The client returns an empty list when the request fails, and logs the error
-  async history(limit = 50, since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)): Promise<Access[]> {
-    const records = await this.driver.getApi().getHistoryEvents(since, new Date(), { deviceSN: this.serial }, limit);
-    return records.flatMap(({ extra }) => parseAccess(extra) ?? []).sort((a, b) => +b.time - +a.time);
+  // newest first. The cloud sends one page at a time, newest first, so this reads back from until to since
+  // until a page brings nothing new. The client returns an empty list when a request fails, and logs the error
+  async history(since: Date, until = new Date()): Promise<Access[]> {
+    const found = new Map<string, Access>();
+    let end = until;
+    for (let page = 0; page < MAX_HISTORY_PAGES; page++) {
+      const records = await this.driver.getApi().getHistoryEvents(since, end, { deviceSN: this.serial }, HISTORY_PAGE);
+      const before = found.size;
+      for (const access of records.flatMap(({ extra }) => parseAccess(extra) ?? [])) {
+        found.set(accessKey(access), access);
+        if (access.time < end) end = access.time;
+      }
+      if (found.size === before) break;
+    }
+    return [...found.values()].sort((a, b) => +b.time - +a.time);
   }
 
   async addUser(rawName: string, pin: string, schedule: Schedule = ALWAYS): Promise<Written> {
@@ -395,6 +408,11 @@ export class Lock {
       listeners.forEach(([event, listener]) => this.driver.off(event as "user error", listener as never));
     }
   }
+}
+
+// the records have no id, and the pages of the cloud overlap at their edges
+export function accessKey(access: Access): string {
+  return `${+access.time}|${access.event}|${access.userId ?? ""}`;
 }
 
 // the access record is JSON in base64

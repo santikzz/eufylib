@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Unconfirmed } from "./errors.ts";
 import { EufyLib, parseAccess } from "./eufylib.ts";
-import { FakeDriver } from "./fake-driver.ts";
+import { access, FakeDriver } from "./fake-driver.ts";
 import type { Schedule } from "./schedule.ts";
 
 async function setup() {
@@ -72,4 +72,15 @@ test("changes, schedules and deletes users by id", async () => {
   await assert.rejects(lock.deleteUser("03"), { kind: "conflict", message: /Several/ });
   await assert.rejects(lock.deleteUser("Ana"), { kind: "not_found" });
   assert.equal(driver.eventNames().length, listening);
+});
+
+test("reads the history back page by page", async () => {
+  const { driver, lock } = await setup();
+  const now = Date.now();
+  driver.history = Array.from({ length: 1234 }, (_, i) => access(265, now - i * 60_000));
+  const read = await lock.history(new Date(now - 2000 * 60_000), new Date(now));
+  assert.equal(read.length, 1234);
+  assert.ok(read.every((item, i) => i === 0 || item.time <= read[i - 1].time));
+  // 3 full pages, then 1 that brings nothing new
+  assert.equal(driver.historyCalls, 4);
 });

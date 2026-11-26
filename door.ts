@@ -1,24 +1,29 @@
 import { setTimeout as sleep } from "node:timers/promises";
+import { estimateBattery, type BatteryEstimate } from "./battery.ts";
 import { EufyError } from "./errors.ts";
-import type { EufyLib, Lock, LoginState, User } from "./eufylib.ts";
+import { accessKey, type Access, type EufyLib, type Lock, type LoginState, type User } from "./eufylib.ts";
 
 const SYNC_MS = 5 * 60_000;
+const DAY = 86_400_000;
+export const HISTORY_DAYS = 90;
 // more attempts can lock the eufy account, so after these an admin must ask for a login
 const MAX_LOGINS = 3;
 
 export type DoorStatus = {
   login: LoginState;
   lock: Record<string, unknown> | null;
+  battery: BatteryEstimate | null;
   syncedAt: Date | null;
   syncError: string | null;
 };
 
-// owns the eufy session: one task at a time, and a user list that is refreshed every 5 minutes
+// owns the eufy session: one task at a time, and a user list and access history that are refreshed every 5 minutes.
+// The history of the last 90 days stays in memory: the first sync reads all of it, the next ones only the last day
 export class Door {
   private lib: EufyLib;
   private serial: string | undefined;
   private queue: Promise<unknown> = Promise.resolve();
-  private cache: { users: User[]; syncedAt: Date } | null = null;
+  private cache: { users: User[]; history: Access[]; syncedAt: Date } | null = null;
   private syncError: string | null = null;
   private logins = 0;
 
@@ -79,12 +84,23 @@ export class Door {
       const { name, model, locked, battery, softwareVersion } = found.status();
       lock = { serial: found.serial, name, model, locked, battery, softwareVersion };
     }
-    return { login, lock, syncedAt: this.cache?.syncedAt ?? null, syncError: this.syncError };
+    const battery = this.cache ? estimateBattery(this.cache.history) : null;
+    return { login, lock, battery, syncedAt: this.cache?.syncedAt ?? null, syncError: this.syncError };
   }
 
   users(): { users: User[]; syncedAt: Date } {
-    if (!this.cache) throw new EufyError(this.syncError ?? "The user list is not loaded yet.", "unavailable");
-    return this.cache;
+    const { users, syncedAt } = this.loaded();
+    return { users, syncedAt };
+  }
+
+  // newest first
+  history(from: Date, until: Date): { history: Access[]; keptFrom: Date; syncedAt: Date } {
+    const { history, syncedAt } = this.loaded();
+    return {
+      history: history.filter((access) => access.time >= from && access.time <= until),
+      keptFrom: new Date(Date.now() - HISTORY_DAYS * DAY),
+      syncedAt,
+    };
   }
 
   async sync(): Promise<void> {
@@ -114,8 +130,19 @@ export class Door {
     return this.lib.lock(this.serial);
   }
 
+  private loaded(): { users: User[]; history: Access[]; syncedAt: Date } {
+    if (!this.cache) throw new EufyError(this.syncError ?? "The user list is not loaded yet.", "unavailable");
+    return this.cache;
+  }
+
   private async refresh(lock: Lock): Promise<void> {
-    this.cache = { users: await lock.users(), syncedAt: new Date() };
+    const kept = Date.now() - HISTORY_DAYS * DAY;
+    const known = this.cache?.history ?? [];
+    // a day again, for events that reach the cloud late. A failed read returns nothing, so the old events stay
+    const since = new Date(known.length ? Date.now() - DAY : kept);
+    const [users, recent] = await Promise.all([lock.users(), lock.history(since)]);
+    const history = new Map([...known, ...recent].filter((access) => +access.time >= kept).map((access) => [accessKey(access), access]));
+    this.cache = { users, history: [...history.values()].sort((a, b) => +b.time - +a.time), syncedAt: new Date() };
     this.syncError = null;
   }
 
