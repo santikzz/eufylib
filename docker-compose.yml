@@ -16,3 +16,6 @@ services:
 
 volumes:
   eufylib-data:
+
+networks:
+  - eufy-network
