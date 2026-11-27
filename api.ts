@@ -56,6 +56,22 @@ export function createApi(door: Door, token: string): Server {
     ["DELETE", /^\/users\/(\w{1,32})$/, async (_, id) => ({
       body: { user: await door.change((lock) => lock.deleteUser(id)) },
     })],
+    // bropat deletes by name, so this removes every user with the name (duplicates cannot be told apart)
+    ["DELETE", /^\/users-named\/([^/]{1,64})$/, async (_, name) => ({
+      body: { deleted: await door.change((lock) => lock.deleteNamed(decodeURIComponent(name))) },
+    })],
+    ["PUT", /^\/users\/(\w{1,32})\/name$/, async (body, id) => ({
+      body: await door.change((lock) => lock.rename(id, text(body, "name"))),
+    })],
+    ["PUT", /^\/settings\/(\w{1,64})$/, async (body, name) => {
+      await door.change((lock) => lock.setSetting(name, settingValue(body, "value")));
+      return { body: { ok: true, setting: name } };
+    }],
+    // opening the door over the token: whoever holds the token can already add a PIN, so this is the same risk
+    ["POST", /^\/(lock|unlock)$/, async (_, action) => {
+      await door.change((lock) => lock.setLocked(action === "lock"));
+      return { body: { ok: true, locked: action === "lock" } };
+    }],
   ];
 
   return createServer(async (request, response) => {
@@ -121,6 +137,14 @@ function text(body: Body, field: string): string {
 
 function optionalText(body: Body, field: string): string | undefined {
   return body[field] === undefined || body[field] === null ? undefined : text(body, field);
+}
+
+function settingValue(body: Body, field: string): boolean | number | string {
+  const value = body[field];
+  if (typeof value !== "boolean" && typeof value !== "number" && typeof value !== "string") {
+    throw new EufyError(`${field} must be a boolean, number or text.`, "invalid");
+  }
+  return value;
 }
 
 // an ISO 8601 time, such as 2026-11-25T03:00:00.000Z

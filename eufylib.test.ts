@@ -74,6 +74,36 @@ test("changes, schedules and deletes users by id", async () => {
   assert.equal(driver.eventNames().length, listening);
 });
 
+test("deletes every user with a duplicate name", async () => {
+  const { driver, lock, listening } = await setup();
+  assert.equal(await lock.deleteNamed("dup"), 2);
+  assert.equal((await lock.users()).filter((user) => user.name.trim() === "dup").length, 0);
+  await assert.rejects(lock.deleteNamed("ghost"), { kind: "not_found" });
+  await assert.rejects(lock.deleteNamed("owner"), { kind: "conflict" });
+  assert.equal(driver.eventNames().length, listening);
+});
+
+test("renames a user and warns about the schedule", async () => {
+  const { driver, lock, listening } = await setup();
+  const range = { type: "range", from: "2026-11-25T18:00", until: "2026-12-31T23:59" } as const;
+  const added = await lock.addUser("tom", "4321", range);
+  const renamed = await lock.rename(added.user.id, "tomas");
+  assert.equal(renamed.user.name, "tomas");
+  assert.match(String(renamed.warning), /schedule/);
+  await assert.rejects(lock.rename("01", "x"), { kind: "conflict", message: /admin/ });
+  await assert.rejects(lock.rename(added.user.id, "dup"), { kind: "conflict" });
+  assert.equal(driver.eventNames().length, listening);
+});
+
+test("writes a lock setting only on proof", async () => {
+  const { driver, lock, listening } = await setup();
+  await lock.setSetting("autoLockTimer", 60);
+  await assert.rejects(lock.setSetting("autoLockTimer", 0), /-133/);
+  await assert.rejects(lock.setSetting("model", "x"), { kind: "invalid" });
+  await assert.rejects(lock.setSetting("unknownThing", 1), { kind: "invalid" });
+  assert.equal(driver.eventNames().length, listening);
+});
+
 test("reads the history back page by page", async () => {
   const { driver, lock } = await setup();
   const now = Date.now();

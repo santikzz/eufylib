@@ -71,7 +71,7 @@ export type Capabilities = {
 type Driver = Pick<
   EufySecurity,
   | "on" | "off" | "close" | "connect" | "isConnected" | "getApi" | "getDevices"
-  | "addUser" | "deleteUser" | "updateUserPasscode" | "updateUserSchedule" | "setDeviceProperty"
+  | "addUser" | "deleteUser" | "updateUser" | "updateUserPasscode" | "updateUserSchedule" | "setDeviceProperty"
 >;
 
 const PERSONAL_EVENTS = new Set<number>([
@@ -294,6 +294,31 @@ export class Lock {
     return user;
   }
 
+  // bropat deletes by exact name, so two users with the same name cannot be told apart: this removes every one.
+  // the eufy app hides some cloud entries (expired, orphaned), so a name can look unique there and be a duplicate here
+  async deleteNamed(rawName: string): Promise<number> {
+    const name = rawName.trim();
+    const matches = (list: User[]) => list.filter((user) => user.name.trim() === name);
+    const found = matches(await this.users());
+    if (!found.length) throw new EufyError(`No user named "${name}".`, "not_found");
+    if (found.some((user) => user.isAdmin)) {
+      throw new EufyError(`"${name}" includes an admin or the owner. Remove it in the eufy app.`, "conflict");
+    }
+    let deleted = 0;
+    // one call may remove one match or all of them, so loop until the name is gone, bounded against a stuck delete
+    for (let guard = found.length + 2; guard > 0; guard--) {
+      const before = matches(await this.users()).length;
+      if (!before) break;
+      await this.userCommand("user deleted", name, () => this.driver.deleteUser(this.serial, name));
+      const after = matches(await this.users()).length;
+      if (after >= before) {
+        throw new Unconfirmed(`Deleted ${deleted} of ${found.length} named "${name}"; the rest did not clear.`);
+      }
+      deleted += before - after;
+    }
+    return deleted;
+  }
+
   async setPin(id: string, pin: string): Promise<User> {
     validPin(pin);
     const user = await this.userById(id);
@@ -306,6 +331,44 @@ export class Lock {
       this.driver.updateUserPasscode(this.serial, user.name, pin),
     );
     return user;
+  }
+
+  async rename(id: string, rawName: string): Promise<Written> {
+    const name = validName(rawName);
+    const user = await this.userById(id);
+    if (user.isAdmin) throw new EufyError(`"${user.name}" is an admin. Rename it in the eufy app.`, "conflict");
+    const others = await this.users();
+    if (others.some((other) => other.id !== id && other.name.trim() === name)) {
+      throw new EufyError(`A user named "${name}" already exists.`, "conflict");
+    }
+    await this.userCommand("user username updated", user.name, () =>
+      this.driver.updateUser(this.serial, user.name, name),
+    );
+    const renamed = (await this.waitForUser((item) => item.id === id && item.name.trim() === name)) ?? { ...user, name };
+    // the lock rewrites the person as entry only and can reset an open-dated schedule, so warn when one exists
+    const warning = user.schedules.length
+      ? "Renaming can reset this person's schedule on the lock. Check it and set it again if needed."
+      : null;
+    return { user: renamed, warning };
+  }
+
+  // write a lock setting that capabilities().settings lists as writable, such as autoLockTimer or wrongTryProtection
+  async setSetting(name: string, value: PropertyValue): Promise<void> {
+    const metadata = this.device.getPropertiesMetadata()[name as PropertyName];
+    if (!metadata?.writeable) throw new EufyError(`"${name}" is not a writable setting of this lock.`, "invalid");
+    await this.confirmed(
+      () => this.driver.setDeviceProperty(this.serial, name as PropertyName, value),
+      (done) => ({
+        "device property changed": (device, changed, newValue) => {
+          if (device.getSerial() === this.serial && changed === name && isDeepStrictEqual(newValue, value)) done();
+        },
+        "station command result": (station, result) => {
+          if (station.getSerial() !== this.device.getStationSerial()) return;
+          if (result.customData?.property?.name !== name) return;
+          done(result.return_code === 0 ? undefined : new EufyError(`The lock refused (code ${result.return_code}).`));
+        },
+      }),
+    );
   }
 
   // for people at a terminal: an id, or else a name
@@ -346,22 +409,25 @@ export class Lock {
       const api = this.driver.getApi();
       const raw = await api.getUsers(this.serial, this.device.getStationSerial());
       const credentials = raw?.find((item) => String(item.short_user_id) === user.id)?.password_list ?? [];
-      const response = await api.request({
-        method: "post",
-        endpoint: "v1/app/device/password/save_or_update",
-        data: {
-          device_sn: this.serial,
-          short_user_id: user.id,
-          station_sn: "",
-          transaction: String(Date.now()),
-          password_list: credentials.map(({ password_id, password_type }) => ({
-            password_id,
-            password_type,
-            schedule: JSON.stringify(toRaw(schedule)),
-          })),
-        },
-      });
-      saved = credentials.length > 0 && (response.data as { code?: number } | undefined)?.code === 0;
+      const data = {
+        device_sn: this.serial,
+        short_user_id: user.id,
+        station_sn: "",
+        transaction: String(Date.now()),
+        password_list: credentials.map(({ password_id, password_type }) => ({
+          password_id,
+          password_type,
+          schedule: JSON.stringify(toRaw(schedule)),
+        })),
+      };
+      // the app (v6) uses the v3 endpoint; v1 still answers on older accounts, so fall back to it
+      for (const endpoint of ["v3/app/device/password/save_or_update", "v1/app/device/password/save_or_update"]) {
+        const response = await api.request({ method: "post", endpoint, data });
+        if (credentials.length > 0 && (response.data as { code?: number } | undefined)?.code === 0) {
+          saved = true;
+          break;
+        }
+      }
     } catch {
       // the lock already obeys, so a failure here is only a warning
     }
@@ -371,7 +437,7 @@ export class Lock {
   }
 
   private async userCommand(
-    success: "user added" | "user deleted" | "user passcode updated" | "user schedule updated",
+    success: "user added" | "user deleted" | "user passcode updated" | "user schedule updated" | "user username updated",
     name: string,
     send: () => Promise<void>,
   ): Promise<void> {

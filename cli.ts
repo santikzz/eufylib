@@ -20,6 +20,8 @@ const HELP = `
   schedule USER always
   schedule USER mon,tue 09:00 18:00
   schedule USER 2026-11-25T18:00 2026-11-26T10:00
+  rename USER NEWNAME           rename a person (can reset their schedule)
+  set NAME VALUE                change a lock setting from caps, VALUE: true/false, a number or text
   history [DAYS]                who opened the door, how and when
   lock | unlock
   watch                         print live events until Ctrl+C (the shell always prints them)
@@ -104,7 +106,14 @@ async function run(lock: Lock, [command, ...args]: string[]): Promise<void> {
       return console.log(`Added ${clean(name)}. PIN ${pin}. The lock never shows it again.`);
     }
     case "delete": {
-      const user = await lock.findUser(need(args[0], "USER"));
+      const who = need(args[0], "USER");
+      const named = (await lock.users()).filter((user) => user.name.trim() === who.trim());
+      if (named.length > 1) {
+        const answer = args[1] === "-y" ? "y" : await ask(`${named.length} users named ${clean(who)}. Delete ALL of them? [y/n] `);
+        if (answer?.toLowerCase() !== "y") return console.log("Nothing deleted.");
+        return console.log(`Deleted ${await lock.deleteNamed(who)} users named ${clean(who)}.`);
+      }
+      const user = await lock.findUser(who);
       const answer = args[1] === "-y" ? "y" : await ask(`Delete ${clean(user.name)} (${clean(user.id)})? [y/n] `);
       if (answer?.toLowerCase() !== "y") return console.log("Nothing deleted.");
       await lock.deleteUser(user.id);
@@ -120,6 +129,19 @@ async function run(lock: Lock, [command, ...args]: string[]): Promise<void> {
       const user = await lock.findUser(need(args[0], "USER"));
       const { warning } = await lock.setSchedule(user.id, readSchedule(args.slice(1)));
       return console.log(warning ?? `Changed the schedule of ${clean(user.name)}.`);
+    }
+    case "rename": {
+      const user = await lock.findUser(need(args[0], "USER"));
+      const newName = need(args[1], "NEWNAME");
+      const { warning } = await lock.rename(user.id, newName);
+      return console.log(warning ?? `Renamed ${clean(user.name)} to ${clean(newName)}.`);
+    }
+    case "set": {
+      const name = need(args[0], "NAME");
+      const raw = need(args[1], "VALUE");
+      const value = raw === "true" ? true : raw === "false" ? false : /^-?\d+$/.test(raw) ? Number(raw) : raw;
+      await lock.setSetting(name, value);
+      return console.log(`Set ${clean(name)} to ${clean(String(value))}.`);
     }
     case "lock":
     case "unlock":

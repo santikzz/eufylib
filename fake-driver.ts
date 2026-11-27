@@ -37,6 +37,7 @@ export class FakeDriver extends EventEmitter {
     getName: () => "door",
     isLock: () => true,
     getProperties: () => ({ name: "door", model: "T8510P", locked: true, battery: 80 }),
+    getPropertiesMetadata: () => ({ autoLockTimer: { writeable: true }, model: { writeable: false } }),
   };
 
   isConnected() { return this.connected; }
@@ -93,6 +94,12 @@ export class FakeDriver extends EventEmitter {
 
   async updateUserPasscode(_: string, name: string) {
     setImmediate(() => this.emit("user passcode updated", this.device, name));
+  }
+
+  async updateUser(_: string, name: string, newName: string) {
+    const user = this.users!.find((item) => item.user_name === name);
+    if (user) user.user_name = newName;
+    setImmediate(() => this.emit("user username updated", this.device, name));
   }
 
   async updateUserSchedule(_: string, name: string, schedule: unknown) {

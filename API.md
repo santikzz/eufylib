@@ -30,7 +30,11 @@ Send `Authorization: Bearer <API_TOKEN>` with every request, except `GET /up`. A
 | `POST` | `/users` | `{ "name", "pin"?, "schedule"? }` | `201 { "user": User, "pin", "warning" }` |
 | `PUT` | `/users/:id/pin` | `{ "pin"? }` | `{ "user": User, "pin" }` |
 | `PUT` | `/users/:id/schedule` | [Schedule](#schedule) | `{ "user": User, "warning" }` |
+| `PUT` | `/users/:id/name` | `{ "name" }` | `{ "user": User, "warning" }`, rename a person |
 | `DELETE` | `/users/:id` | | `{ "user": User }` |
+| `DELETE` | `/users-named/:name` | | `{ "deleted": <count> }`, removes every user with that exact name |
+| `PUT` | `/settings/:name` | `{ "value" }` | `{ "ok": true, "setting" }`, value boolean, number or text |
+| `POST` | `/lock` and `/unlock` | | `{ "ok": true, "locked" }` |
 
 - `from`, `until`: ISO 8601 times, for example `2026-11-18T03:00:00.000Z`. `until` is now when it is not given, and
   `from` is 7 days before `until`. `keptFrom` is the start of the 90 days in the cache: an older `from` gets no more.
@@ -38,7 +42,13 @@ Send `Authorization: Bearer <API_TOKEN>` with every request, except `GET /up`. A
 - `pin`: 4 to 8 digits. Without it the service makes a random 6-digit PIN. The reply is the only place it appears.
 - `schedule`: `{ "type": "always" }` when it is not given.
 - `warning`: not null when the lock has the new schedule but the copy for the eufy app did not change. Save the same
-  schedule again.
+  schedule again. On a rename it is not null when the rename may have reset the person's schedule.
+- `/users-named/:name`: deletes every user with that exact name. The client matches by name, so duplicates cannot be
+  told apart and are removed as a group. The eufy app hides some entries (expired, orphaned), so a name can look
+  unique there and be a duplicate here. URL-encode a name that has spaces.
+- `/settings/:name`: writes a setting the lock reports as writable, for example `autoLockTimer` or
+  `wrongTryProtection`. The CLI `caps` lists the writable names. The value is a boolean, a number or text.
+- `/lock` and `/unlock`: whoever holds the token can open the door, so keep the API private.
 
 ## Types
 
