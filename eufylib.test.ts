@@ -92,6 +92,7 @@ test("renames a user and warns about the schedule", async () => {
   assert.match(String(renamed.warning), /schedule/);
   await assert.rejects(lock.rename("01", "x"), { kind: "conflict", message: /admin/ });
   await assert.rejects(lock.rename(added.user.id, "dup"), { kind: "conflict" });
+  await assert.rejects(lock.rename("03", "solo"), { kind: "conflict", message: /Several/ });
   assert.equal(driver.eventNames().length, listening);
 });
 

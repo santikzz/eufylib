@@ -56,8 +56,9 @@ export function createApi(door: Door, token: string): Server {
     ["DELETE", /^\/users\/(\w{1,32})$/, async (_, id) => ({
       body: { user: await door.change((lock) => lock.deleteUser(id)) },
     })],
-    // bropat deletes by name, so this removes every user with the name (duplicates cannot be told apart)
-    ["DELETE", /^\/users-named\/([^/]{1,64})$/, async (_, name) => ({
+    // bropat deletes by name, so this removes every user with the name (duplicates cannot be told apart).
+    // a name is up to 255 bytes, and each byte is up to 3 characters in the url
+    ["DELETE", /^\/users-named\/([^/]{1,765})$/, async (_, name) => ({
       body: { deleted: await door.change((lock) => lock.deleteNamed(decodeURIComponent(name))) },
     })],
     ["PUT", /^\/users\/(\w{1,32})\/name$/, async (body, id) => ({
